@@ -13,6 +13,7 @@ code
 - ~~pred_model: prediction model, not applicable current~~
 - pred_one: train the prediction model for one unit
 - pred_group: cluster different groups, and train the prediction models for different groups using the meta-learning MAML, the base model is RandomForestRegressor
+- SAC: dispatch the power using SAC RL model
 
 code logic:
 - prediction: predict the power output for each unit
