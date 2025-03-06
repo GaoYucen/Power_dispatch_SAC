@@ -4,7 +4,26 @@ import torch.optim as optim
 import numpy as np
 import gym
 from torch.distributions import Categorical
+import pandas as pd
+from tqdm import tqdm
+import random
 
+# 导入配置文件
+import config
+
+import argparse
+
+# 检查CUDA和MPS是否可用
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+# elif torch.backends.mps.is_available():
+#     device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+print('Using device:', device)
+
+#%%
 # 定义策略网络（Actor）
 class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -45,12 +64,12 @@ class SACAgent:
         self.tau = tau
         self.alpha = alpha
 
-        # 初始化网络
-        self.policy_net = PolicyNetwork(state_dim, action_dim)
-        self.q_net1 = ValueNetwork(state_dim, action_dim)
-        self.q_net2 = ValueNetwork(state_dim, action_dim)
-        self.target_q_net1 = ValueNetwork(state_dim, action_dim)
-        self.target_q_net2 = ValueNetwork(state_dim, action_dim)
+        # 初始化网络并移动到设备上
+        self.policy_net = PolicyNetwork(state_dim, action_dim).to(device)
+        self.q_net1 = ValueNetwork(state_dim, action_dim).to(device)
+        self.q_net2 = ValueNetwork(state_dim, action_dim).to(device)
+        self.target_q_net1 = ValueNetwork(state_dim, action_dim).to(device)
+        self.target_q_net2 = ValueNetwork(state_dim, action_dim).to(device)
 
         # 复制目标网络参数
         self.target_q_net1.load_state_dict(self.q_net1.state_dict())
@@ -62,16 +81,16 @@ class SACAgent:
         self.q2_optimizer = optim.Adam(self.q_net2.parameters(), lr=3e-4)
 
     def select_action(self, state):
-        state = torch.FloatTensor(state).unsqueeze(0)
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
         action, _ = self.policy_net(state)
-        return action.detach().numpy()[0]
+        return action.detach().cpu().numpy()[0]
 
     def update(self, state, action, reward, next_state, done):
-        state = torch.FloatTensor(state).unsqueeze(0)  # 确保输入为二维张量
-        action = torch.LongTensor([action]).unsqueeze(0)  # 确保输入为二维张量
-        reward = torch.FloatTensor([reward]).unsqueeze(0)  # 确保输入为二维张量
-        next_state = torch.FloatTensor(next_state).unsqueeze(0)  # 确保输入为二维张量
-        done = torch.FloatTensor([done]).unsqueeze(0)  # 确保输入为二维张量
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
+        action = torch.LongTensor([action]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
+        reward = torch.FloatTensor([reward]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
+        next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
+        done = torch.FloatTensor([done]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
 
         # 计算目标 Q 值
         with torch.no_grad():
@@ -113,21 +132,23 @@ class SACAgent:
         for target_param, param in zip(self.target_q_net2.parameters(), self.q_net2.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-
-# 假设的用电计划
-electricity_plan = [100, 200, 150, 300, 250]  # 每个时间步的用电量需求
-
 # 假设的成本函数（开机成本+时间*发电成本）
 def cost_function(action, time):
     startup_cost = 10
-    generation_cost = 0.5
+    generation_cost = 0
     return (startup_cost + generation_cost) * action
 
 
 # 定义环境（简单示例）
 class PowerDispatchEnv(gym.Env):
     def __init__(self, electricity_plan):
-        self.electricity_plan = electricity_plan
+        self.electricity_plan_original = electricity_plan
+        # 将electricity_plan中随机取0
+        np.random.seed(42)  # 设置随机种子以确保结果可复现
+        self.electricity_plan = np.array(electricity_plan)
+        num_zeros = int(0.1 * len(self.electricity_plan))  # 假设将 10% 的数值设为 0
+        zero_indices = np.random.choice(len(self.electricity_plan), num_zeros, replace=False)
+        self.electricity_plan[zero_indices] = 0
         self.current_step = 0
         self.action_space = gym.spaces.Discrete(2)  # 动作空间为 0 或 1
         self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
@@ -139,30 +160,115 @@ class PowerDispatchEnv(gym.Env):
     def step(self, action):
         demand = self.electricity_plan[self.current_step]
         cost = cost_function(action, self.current_step)
-        generation_power = 300 if action == 1 else 0
+        generation_power = self.electricity_plan_original[self.current_step] if action == 1 else 0
         reward = -cost if generation_power >= demand else -1000  # 惩罚未满足用电需求
         self.current_step += 1
         done = self.current_step == len(self.electricity_plan)
         next_state = np.array([self.electricity_plan[self.current_step]] if not done else [0])
         return next_state, reward, done, {}
 
+#%% 解析命令行参数
+parser = argparse.ArgumentParser(description='SAC power dispatch')
+parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Mode to run the script in')
+args = parser.parse_args()
 
+mode = args.mode
+
+# 固定随机种子
+seed = 42
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+
+# 如果使用了 CUDA
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+#%% 读取实际功率的文件
+# read the csv data 'data/11.csv'
+data = pd.read_csv('data/11.csv')
+# Removes the line containing NaN
+data = data.dropna()
+
+# 取前 num_time_steps 个时间步的数据作为用电计划
+electricity_plan = data['ROUND(A.POWER,0)'].values[:config.num_time_steps]
+# 将负值替换为 0
+electricity_plan = np.where(electricity_plan < 0, 0, electricity_plan)
+
+#%%
 # 训练 SAC 代理
 env = PowerDispatchEnv(electricity_plan)
+# 统计一下有多少个0
+print(np.sum(env.electricity_plan == 0))
+
+#%%
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n
-agent = SACAgent(state_dim, action_dim)
+agent = SACAgent(state_dim, action_dim, gamma=config.gamma, tau=config.tau, alpha=config.alpha)
 
-num_episodes = 1000
-for episode in range(num_episodes):
+if mode == 'train':
+    num_episodes = config.num_epochs
+
+    import os
+
+    # Create results directory if it doesn't exist
+    os.makedirs('results', exist_ok=True)
+
+    # Open a file to write the rewards
+    with open('results/SAC.txt', 'w') as f:
+        best_reward = -float('inf')
+        patience = 100  # Number of episodes to wait for improvement
+        patience_counter = 0
+
+        for episode in tqdm(range(num_episodes)):
+            state = env.reset()
+            total_reward = 0
+            done = False
+            while not done:
+                action = agent.select_action(state)
+                next_state, reward, done, _ = env.step(action)
+                agent.update(state, action, reward, next_state, done)
+                state = next_state
+                total_reward += reward
+
+            # Write the reward to the file
+            f.write(f"Episode {episode}: Total Reward = {total_reward}\n")
+
+            # Check for early stopping
+            if total_reward > best_reward:
+                best_reward = total_reward
+                patience_counter = 0
+                # Save the best model parameters
+                torch.save(agent.policy_net.state_dict(), 'param/best_policy_net.pth')
+                torch.save(agent.q_net1.state_dict(), 'param/best_q_net1.pth')
+                torch.save(agent.q_net2.state_dict(), 'param/best_q_net2.pth')
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping at episode {episode}")
+                break
+
+            if episode % 100 == 0:
+                print(f"Episode {episode}: Total Reward = {total_reward}")
+
+elif mode == 'test':
+    #%% 测试
+    # Load the best model parameters
+    agent.policy_net.load_state_dict(torch.load('param/best_policy_net.pth'))
+    agent.q_net1.load_state_dict(torch.load('param/best_q_net1.pth'))
+    agent.q_net2.load_state_dict(torch.load('param/best_q_net2.pth'))
+
+    # Test the agent
     state = env.reset()
-    total_reward = 0
     done = False
-    while not done:
-        action = agent.select_action(state)
-        next_state, reward, done, _ = env.step(action)
-        agent.update(state, action, reward, next_state, done)
-        state = next_state
-        total_reward += reward
-    if episode % 100 == 0:
-        print(f"Episode {episode}: Total Reward = {total_reward}")
+total_reward = 0
+while not done:
+    action = agent.select_action(state)
+    next_state, reward, done, _ = env.step(action)
+    state = next_state
+    total_reward += reward
+
+print(f"Total Reward = {total_reward}")
