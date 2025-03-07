@@ -18,7 +18,7 @@ code
 code logic:
 - prediction: predict the power output for each unit
 - meta-learning: to applied to different units
-- SAC: to dispatch power
+- SAC: to dispatch power, with predictor
 
 experiment
 - baselines:
