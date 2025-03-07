@@ -1,17 +1,21 @@
+import joblib
+import pandas as pd
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
+
 import gym
 from torch.distributions import Categorical
-import pandas as pd
-from tqdm import tqdm
+
 import random
+from tqdm import tqdm
 
-# 导入配置文件
 import config
-
+import os
 import argparse
+import re
 
 # 检查CUDA和MPS是否可用
 if torch.cuda.is_available():
@@ -22,6 +26,31 @@ else:
     device = torch.device("cpu")
 
 print('Using device:', device)
+
+
+# Load the trained prediction model
+def load_prediction_model(unit_id=11):
+    model_path = f'param/pred_model_{unit_id}.joblib'
+    if os.path.exists(model_path):
+        return joblib.load(model_path)
+    else:
+        print(f"Warning: Prediction model {model_path} not found")
+        return None
+
+# Use the prediction model to get power predictions
+def get_power_predictions(model, data, unit_id=11):
+    if model is None:
+        # If no model is available, return zeros or some default value
+        return np.zeros(len(data))
+
+    # Prepare input features (excluding target variables and time)
+    X = data.drop(['DATATIME', 'PREPOWER', 'YD15', 'ROUND(A.POWER,0)'], axis=1)
+    # 替换特征名中的特殊字符
+    X.columns = [re.sub(r'[^a-zA-Z0-9_]', '_', col) for col in X.columns]
+
+    # Predict power output
+    predicted_power = model.predict(X)
+    return predicted_power
 
 #%%
 # 定义策略网络（Actor）
@@ -41,7 +70,6 @@ class PolicyNetwork(nn.Module):
         log_prob = dist.log_prob(action)
         return action, log_prob
 
-
 # 定义价值网络（Critic）
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -55,7 +83,6 @@ class ValueNetwork(nn.Module):
         x = torch.relu(self.fc2(x))
         q_values = self.fc3(x)
         return q_values
-
 
 # 定义 SAC 代理类
 class SACAgent:
@@ -138,38 +165,59 @@ def cost_function(action, time):
     generation_cost = 0
     return (startup_cost + generation_cost) * action
 
+# def cost_function(action, time, power_level=None):
+#     startup_cost = 10 if action == 1 else 0
+#     generation_cost = 0.05 * power_level if power_level is not None and action == 1 else 0
+#     return startup_cost + generation_cost
 
 # 定义环境（简单示例）
 class PowerDispatchEnv(gym.Env):
-    def __init__(self, electricity_plan):
+    def __init__(self, electricity_plan, predicted_power):
         self.electricity_plan_original = electricity_plan
+        self.predicted_power = predicted_power
+
         # 将electricity_plan中随机取0
         np.random.seed(42)  # 设置随机种子以确保结果可复现
         self.electricity_plan = np.array(electricity_plan)
         num_zeros = int(0.1 * len(self.electricity_plan))  # 假设将 10% 的数值设为 0
         zero_indices = np.random.choice(len(self.electricity_plan), num_zeros, replace=False)
         self.electricity_plan[zero_indices] = 0
+
         self.current_step = 0
         self.action_space = gym.spaces.Discrete(2)  # 动作空间为 0 或 1
-        self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(2,), dtype=np.float32)
 
     def reset(self):
         self.current_step = 0
-        return np.array([self.electricity_plan[self.current_step]])
+        return np.array([
+            self.electricity_plan[self.current_step],
+            self.predicted_power[self.current_step]
+        ])
 
     def step(self, action):
         demand = self.electricity_plan[self.current_step]
+        predicted_power = self.predicted_power[self.current_step]
+
         cost = cost_function(action, self.current_step)
+
         generation_power = self.electricity_plan_original[self.current_step] if action == 1 else 0
+
         reward = -cost if generation_power >= demand else -1000  # 惩罚未满足用电需求
         self.current_step += 1
         done = self.current_step == len(self.electricity_plan)
-        next_state = np.array([self.electricity_plan[self.current_step]] if not done else [0])
+        if not done:
+            next_state = np.array([
+                self.electricity_plan[self.current_step],
+                self.predicted_power[self.current_step]
+            ])
+        else:
+            next_state = np.array([0, 0])
         return next_state, reward, done, {}
 
 #%% 解析命令行参数
 parser = argparse.ArgumentParser(description='SAC power dispatch')
 parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='Mode to run the script in')
+parser.add_argument('--unit_id', type=int, default=11, help='Power unit ID (11-20)')
 args = parser.parse_args()
 
 mode = args.mode
@@ -185,11 +233,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-#%% 读取实际功率的文件
-# read the csv data 'data/11.csv'
-data = pd.read_csv('data/11.csv')
-# Removes the line containing NaN
+# Load data
+unit_id = args.unit_id
+data = pd.read_csv(f'data/{unit_id}.csv')
 data = data.dropna()
 
 # 取前 num_time_steps 个时间步的数据作为用电计划
@@ -197,11 +243,17 @@ electricity_plan = data['ROUND(A.POWER,0)'].values[:config.num_time_steps]
 # 将负值替换为 0
 electricity_plan = np.where(electricity_plan < 0, 0, electricity_plan)
 
+#%% Load prediction model and get predictions
+pred_model = load_prediction_model(unit_id)
+predicted_power = get_power_predictions(pred_model, data[:config.num_time_steps], unit_id)
+
 #%%
 # 训练 SAC 代理
-env = PowerDispatchEnv(electricity_plan)
+env = PowerDispatchEnv(electricity_plan, predicted_power)
 # 统计一下有多少个0
 print(np.sum(env.electricity_plan == 0))
+
+
 
 #%%
 state_dim = env.observation_space.shape[0]
@@ -210,9 +262,6 @@ agent = SACAgent(state_dim, action_dim, gamma=config.gamma, tau=config.tau, alph
 
 if mode == 'train':
     num_episodes = config.num_epochs
-
-    import os
-
     # Create results directory if it doesn't exist
     os.makedirs('results', exist_ok=True)
 
@@ -226,6 +275,7 @@ if mode == 'train':
             state = env.reset()
             total_reward = 0
             done = False
+
             while not done:
                 action = agent.select_action(state)
                 next_state, reward, done, _ = env.step(action)
@@ -241,9 +291,10 @@ if mode == 'train':
                 best_reward = total_reward
                 patience_counter = 0
                 # Save the best model parameters
-                torch.save(agent.policy_net.state_dict(), 'param/best_policy_net.pth')
-                torch.save(agent.q_net1.state_dict(), 'param/best_q_net1.pth')
-                torch.save(agent.q_net2.state_dict(), 'param/best_q_net2.pth')
+                os.makedirs('param', exist_ok=True)
+                torch.save(agent.policy_net.state_dict(), f'param/best_policy_net_unit_{unit_id}.pth')
+                torch.save(agent.q_net1.state_dict(), f'param/best_q_net1_unit_{unit_id}.pth')
+                torch.save(agent.q_net2.state_dict(), f'param/best_q_net2_unit_{unit_id}.pth')
             else:
                 patience_counter += 1
 
@@ -257,18 +308,22 @@ if mode == 'train':
 elif mode == 'test':
     #%% 测试
     # Load the best model parameters
-    agent.policy_net.load_state_dict(torch.load('param/best_policy_net.pth'))
-    agent.q_net1.load_state_dict(torch.load('param/best_q_net1.pth'))
-    agent.q_net2.load_state_dict(torch.load('param/best_q_net2.pth'))
+    agent.policy_net.load_state_dict(torch.load(f'param/best_policy_net_unit_{unit_id}.pth'))
+    agent.q_net1.load_state_dict(torch.load(f'param/best_q_net1_unit_{unit_id}.pth'))
+    agent.q_net2.load_state_dict(torch.load(f'param/best_q_net2_unit_{unit_id}.pth'))
 
     # Test the agent
     state = env.reset()
     done = False
-total_reward = 0
-while not done:
-    action = agent.select_action(state)
-    next_state, reward, done, _ = env.step(action)
-    state = next_state
-    total_reward += reward
+    total_reward = 0
+    actions = []
 
-print(f"Total Reward = {total_reward}")
+    while not done:
+        action = agent.select_action(state)
+        actions.append(action)
+        next_state, reward, done, _ = env.step(action)
+        state = next_state
+        total_reward += reward
+
+    print(f"Total Reward = {total_reward}")
+    print(f"Action distribution: {np.sum(actions)}/{len(actions)} active periods")
