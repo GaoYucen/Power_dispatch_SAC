@@ -245,7 +245,14 @@ electricity_plan = np.where(electricity_plan < 0, 0, electricity_plan)
 
 #%% Load prediction model and get predictions
 pred_model = load_prediction_model(unit_id)
-predicted_power = get_power_predictions(pred_model, data[:config.num_time_steps], unit_id)
+# predicted_power = get_power_predictions(pred_model, data[:config.num_time_steps], unit_id)
+
+# 使用前5步的平均值作为当前步的预测值构造predicted_power
+predicted_power = np.zeros_like(electricity_plan)
+predicted_power[:5] = electricity_plan[:5].mean()
+for i in range(5, len(predicted_power)):
+    predicted_power[i] = electricity_plan[i - 5:i].mean()
+# print(predicted_power)
 
 #%%
 # 训练 SAC 代理
