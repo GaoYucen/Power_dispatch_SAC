@@ -64,11 +64,18 @@ class PolicyNetwork(nn.Module):
     def forward(self, state):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
-        logits = self.fc3(x)
-        dist = Categorical(logits=logits)
+        action_logits = self.fc3(x)
+        action_probs = torch.softmax(action_logits, dim=-1)
+        dist = Categorical(action_probs)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return action, log_prob
+
+    def get_probs(self, state):
+        x = torch.relu(self.fc1(state))
+        x = torch.relu(self.fc2(x))
+        action_logits = self.fc3(x)
+        return torch.softmax(action_logits, dim=-1)
 
 # 定义价值网络（Critic）
 class ValueNetwork(nn.Module):
@@ -84,79 +91,147 @@ class ValueNetwork(nn.Module):
         q_values = self.fc3(x)
         return q_values
 
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def add(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = map(np.stack, zip(*batch))
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
 # 定义 SAC 代理类
 class SACAgent:
-    def __init__(self, state_dim, action_dim, gamma=0.95, tau=0.01, alpha=0.2):
+    def __init__(self, state_dim, action_dim, gamma=0.95, tau=0.005, alpha=0.2, lr=3e-4, batch_size=256,
+                 buffer_size=10000):
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
+        self.batch_size = batch_size
+        self.action_dim = action_dim
 
-        # 初始化网络并移动到设备上
+        # Networks
         self.policy_net = PolicyNetwork(state_dim, action_dim).to(device)
         self.q_net1 = ValueNetwork(state_dim, action_dim).to(device)
         self.q_net2 = ValueNetwork(state_dim, action_dim).to(device)
         self.target_q_net1 = ValueNetwork(state_dim, action_dim).to(device)
         self.target_q_net2 = ValueNetwork(state_dim, action_dim).to(device)
 
-        # 复制目标网络参数
+        # Copy weights to target networks
         self.target_q_net1.load_state_dict(self.q_net1.state_dict())
         self.target_q_net2.load_state_dict(self.q_net2.state_dict())
 
-        # 定义优化器
-        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
-        self.q1_optimizer = optim.Adam(self.q_net1.parameters(), lr=3e-4)
-        self.q2_optimizer = optim.Adam(self.q_net2.parameters(), lr=3e-4)
+        # Optimizers
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.q1_optimizer = optim.Adam(self.q_net1.parameters(), lr=lr)
+        self.q2_optimizer = optim.Adam(self.q_net2.parameters(), lr=lr)
 
-    def select_action(self, state):
+        # Replay buffer
+        self.replay_buffer = ReplayBuffer(buffer_size)
+
+    def select_action(self, state, evaluate=False):
         state = torch.FloatTensor(state).unsqueeze(0).to(device)
-        action, _ = self.policy_net(state)
-        return action.detach().cpu().numpy()[0]
-
-    def update(self, state, action, reward, next_state, done):
-        state = torch.FloatTensor(state).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        action = torch.LongTensor([action]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        reward = torch.FloatTensor([reward]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        done = torch.FloatTensor([done]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-
-        # 计算目标 Q 值
         with torch.no_grad():
-            next_action, next_log_prob = self.policy_net(next_state)
-            next_q1 = self.target_q_net1(next_state)
-            next_q2 = self.target_q_net2(next_state)
-            next_q = torch.min(next_q1, next_q2)
-            # 确保 gather 操作的维度正确
-            target_q = reward + (1 - done) * self.gamma * (next_q.gather(1, next_action.unsqueeze(1)) - self.alpha * next_log_prob.unsqueeze(1))
+            if evaluate:  # During evaluation, use most likely action
+                action_probs = self.policy_net.get_probs(state)
+                action = torch.argmax(action_probs).item()
+            else:  # During training, sample from the distribution
+                action, _ = self.policy_net(state)
+                action = action.item()
+        return action
 
-        # 更新 Q 网络
-        q1 = self.q_net1(state).gather(1, action)
-        q2 = self.q_net2(state).gather(1, action)
-        q1_loss = nn.MSELoss()(q1, target_q)
-        q2_loss = nn.MSELoss()(q2, target_q)
+    def store_transition(self, state, action, reward, next_state, done):
+        self.replay_buffer.add(state, action, reward, next_state, done)
 
+    def update(self, state=None, action=None, reward=None, next_state=None, done=None):
+        # Store transition if provided
+        if state is not None:
+            self.store_transition(state, action, reward, next_state, done)
+
+        # Only update if we have enough samples
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        # Sample a batch from replay buffer
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+
+        states = torch.FloatTensor(states).to(device)
+        actions = torch.LongTensor(actions).to(device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
+        next_states = torch.FloatTensor(next_states).to(device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+
+        # Update Q-networks
+        with torch.no_grad():
+            # Get probabilities for next actions
+            next_action_probs = self.policy_net.get_probs(next_states)
+            next_log_probs = torch.log(next_action_probs + 1e-10)  # Add small epsilon to avoid log(0)
+
+            # Get Q values for next states from target networks
+            next_q1_values = self.target_q_net1(next_states)
+            next_q2_values = self.target_q_net2(next_states)
+            next_q_values = torch.min(next_q1_values, next_q2_values)
+
+            # Calculate expected Q values (soft value)
+            expected_q_values = next_action_probs * (next_q_values - self.alpha * next_log_probs)
+            expected_q_values = expected_q_values.sum(dim=1, keepdim=True)
+            target_q_values = rewards + (1 - dones) * self.gamma * expected_q_values
+
+        # Get current Q estimates
+        current_q1_values = self.q_net1(states)
+        current_q2_values = self.q_net2(states)
+
+        # Select Q values for actions taken
+        current_q1_values = current_q1_values.gather(1, actions.unsqueeze(1))
+        current_q2_values = current_q2_values.gather(1, actions.unsqueeze(1))
+
+        # Compute Q network losses
+        q1_loss = nn.MSELoss()(current_q1_values, target_q_values.detach())
+        q2_loss = nn.MSELoss()(current_q2_values, target_q_values.detach())
+
+        # Update Q networks
         self.q1_optimizer.zero_grad()
-        q1_loss.backward(retain_graph=True)
+        q1_loss.backward()
         self.q1_optimizer.step()
 
         self.q2_optimizer.zero_grad()
         q2_loss.backward()
         self.q2_optimizer.step()
 
-        # 更新策略网络
-        new_action, log_prob = self.policy_net(state)
-        q1_new = self.q_net1(state)
-        q2_new = self.q_net2(state)
-        q_new = torch.min(q1_new, q2_new)
-        policy_loss = (self.alpha * log_prob.unsqueeze(1) - q_new.gather(1, new_action.unsqueeze(1))).mean()
+        # Update policy network
+        action_probs = self.policy_net.get_probs(states)
+        log_probs = torch.log(action_probs + 1e-10)
+
+        q1_values = self.q_net1(states)
+        q2_values = self.q_net2(states)
+        q_values = torch.min(q1_values, q2_values)
+
+        # Calculate policy loss (maximize expected return with entropy regularization)
+        inside_term = self.alpha * log_probs - q_values
+        policy_loss = (action_probs * inside_term).sum(dim=1).mean()
 
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         self.policy_optimizer.step()
 
-        # 软更新目标网络
-        for target_param, param in zip(self.target_q_net1.parameters(), self.q_net1.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        for target_param, param in zip(self.target_q_net2.parameters(), self.q_net2.parameters()):
+        # Soft update of target networks
+        self._soft_update(self.q_net1, self.target_q_net1)
+        self._soft_update(self.q_net2, self.target_q_net2)
+
+    def _soft_update(self, source, target):
+        for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
 # 假设的成本函数（开机成本+时间*发电成本）
@@ -269,13 +344,11 @@ agent = SACAgent(state_dim, action_dim, gamma=config.gamma, tau=config.tau, alph
 
 if mode == 'train':
     num_episodes = config.num_epochs
-    # Create results directory if it doesn't exist
     os.makedirs('results', exist_ok=True)
 
-    # Open a file to write the rewards
     with open('results/SAC.txt', 'w') as f:
         best_reward = -float('inf')
-        patience = 100  # Number of episodes to wait for improvement
+        patience = 100
         patience_counter = 0
 
         for episode in tqdm(range(num_episodes)):
@@ -286,12 +359,18 @@ if mode == 'train':
             while not done:
                 action = agent.select_action(state)
                 next_state, reward, done, _ = env.step(action)
-                agent.update(state, action, reward, next_state, done)
+                agent.store_transition(state, action, reward, next_state, done)
                 state = next_state
                 total_reward += reward
 
+                # Update the agent multiple times per step
+                for _ in range(1):  # You can adjust this number
+                    agent.update()
+
             # Write the reward to the file
             f.write(f"Episode {episode}: Total Reward = {total_reward}\n")
+
+            # Early stopping logic remains the same
 
             # Check for early stopping
             if total_reward > best_reward:
@@ -326,7 +405,7 @@ elif mode == 'test':
     actions = []
 
     while not done:
-        action = agent.select_action(state)
+        action = agent.select_action(state, evaluate=True)
         actions.append(action)
         next_state, reward, done, _ = env.step(action)
         state = next_state

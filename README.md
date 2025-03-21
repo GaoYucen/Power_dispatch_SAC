@@ -22,5 +22,9 @@ code logic:
 
 experiment
 - baselines:
+  - A2C: -72000
+  - SAC: -890
+  - DQN: -760
+  - Rainbow DQN: -890
 - ablation study
   - no meta-learning, train one model for all units, report the results w/o meta-learning

@@ -53,10 +53,9 @@ def get_power_predictions(model, data, unit_id=11):
     return predicted_power
 
 #%%
-# 定义策略网络（Actor）
-class PolicyNetwork(nn.Module):
+class ActorNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(PolicyNetwork, self).__init__()
+        super(ActorNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
@@ -64,100 +63,110 @@ class PolicyNetwork(nn.Module):
     def forward(self, state):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
-        logits = self.fc3(x)
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action, log_prob
+        action_probs = torch.softmax(self.fc3(x), dim=-1)
+        return action_probs
 
-# 定义价值网络（Critic）
-class ValueNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
-        super(ValueNetwork, self).__init__()
+
+class CriticNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256):
+        super(CriticNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)  # Output is state value V(s)
 
     def forward(self, state):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
-        q_values = self.fc3(x)
-        return q_values
+        value = self.fc3(x)
+        return value
 
-# 定义 SAC 代理类
-class SACAgent:
-    def __init__(self, state_dim, action_dim, gamma=0.95, tau=0.01, alpha=0.2):
+
+class A2CAgent:
+    def __init__(self, state_dim, action_dim, gamma=0.95, lr_actor=3e-4, lr_critic=1e-3, entropy_weight=0.01):
         self.gamma = gamma
-        self.tau = tau
-        self.alpha = alpha
+        self.entropy_weight = entropy_weight
 
-        # 初始化网络并移动到设备上
-        self.policy_net = PolicyNetwork(state_dim, action_dim).to(device)
-        self.q_net1 = ValueNetwork(state_dim, action_dim).to(device)
-        self.q_net2 = ValueNetwork(state_dim, action_dim).to(device)
-        self.target_q_net1 = ValueNetwork(state_dim, action_dim).to(device)
-        self.target_q_net2 = ValueNetwork(state_dim, action_dim).to(device)
+        # Actor and critic networks
+        self.actor = ActorNetwork(state_dim, action_dim).to(device)
+        self.critic = CriticNetwork(state_dim).to(device)
 
-        # 复制目标网络参数
-        self.target_q_net1.load_state_dict(self.q_net1.state_dict())
-        self.target_q_net2.load_state_dict(self.q_net2.state_dict())
+        # Optimizers
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-        # 定义优化器
-        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
-        self.q1_optimizer = optim.Adam(self.q_net1.parameters(), lr=3e-4)
-        self.q2_optimizer = optim.Adam(self.q_net2.parameters(), lr=3e-4)
+        # For storing trajectory information
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.next_states = []
+        self.dones = []
 
     def select_action(self, state):
         state = torch.FloatTensor(state).unsqueeze(0).to(device)
-        action, _ = self.policy_net(state)
-        return action.detach().cpu().numpy()[0]
-
-    def update(self, state, action, reward, next_state, done):
-        state = torch.FloatTensor(state).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        action = torch.LongTensor([action]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        reward = torch.FloatTensor([reward]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-        done = torch.FloatTensor([done]).unsqueeze(0).to(device)  # 确保输入为二维张量并移动到设备上
-
-        # 计算目标 Q 值
         with torch.no_grad():
-            next_action, next_log_prob = self.policy_net(next_state)
-            next_q1 = self.target_q_net1(next_state)
-            next_q2 = self.target_q_net2(next_state)
-            next_q = torch.min(next_q1, next_q2)
-            # 确保 gather 操作的维度正确
-            target_q = reward + (1 - done) * self.gamma * (next_q.gather(1, next_action.unsqueeze(1)) - self.alpha * next_log_prob.unsqueeze(1))
+            action_probs = self.actor(state)
 
-        # 更新 Q 网络
-        q1 = self.q_net1(state).gather(1, action)
-        q2 = self.q_net2(state).gather(1, action)
-        q1_loss = nn.MSELoss()(q1, target_q)
-        q2_loss = nn.MSELoss()(q2, target_q)
+        # Sample action from the probability distribution
+        dist = Categorical(action_probs)
+        action = dist.sample()
 
-        self.q1_optimizer.zero_grad()
-        q1_loss.backward(retain_graph=True)
-        self.q1_optimizer.step()
+        return action.item()
 
-        self.q2_optimizer.zero_grad()
-        q2_loss.backward()
-        self.q2_optimizer.step()
+    def store_transition(self, state, action, reward, next_state, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.next_states.append(next_state)
+        self.dones.append(done)
 
-        # 更新策略网络
-        new_action, log_prob = self.policy_net(state)
-        q1_new = self.q_net1(state)
-        q2_new = self.q_net2(state)
-        q_new = torch.min(q1_new, q2_new)
-        policy_loss = (self.alpha * log_prob.unsqueeze(1) - q_new.gather(1, new_action.unsqueeze(1))).mean()
+    def update(self):
+        if len(self.states) == 0:
+            return
 
-        self.policy_optimizer.zero_grad()
-        policy_loss.backward()
-        self.policy_optimizer.step()
+        # Convert stored transitions to tensors
+        states = torch.FloatTensor(np.array(self.states)).to(device)
+        actions = torch.LongTensor(self.actions).to(device)
+        rewards = torch.FloatTensor(self.rewards).to(device).unsqueeze(1)
+        next_states = torch.FloatTensor(np.array(self.next_states)).to(device)
+        dones = torch.FloatTensor(self.dones).to(device).unsqueeze(1)
 
-        # 软更新目标网络
-        for target_param, param in zip(self.target_q_net1.parameters(), self.q_net1.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        for target_param, param in zip(self.target_q_net2.parameters(), self.q_net2.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        # Get state values
+        values = self.critic(states)
+        next_values = self.critic(next_states)
+
+        # Compute TD targets and advantages
+        # For the last state, we use 0 if done, otherwise the predicted value
+        targets = rewards + self.gamma * next_values * (1 - dones)
+        advantages = targets - values
+
+        # Calculate actor (policy) loss
+        action_probs = self.actor(states)
+        dist = Categorical(action_probs)
+        log_probs = dist.log_prob(actions)
+        entropy = dist.entropy()
+
+        # Actor loss: maximize (advantage * log_prob + entropy_weight * entropy)
+        actor_loss = -torch.mean(log_probs * advantages.detach() + self.entropy_weight * entropy)
+
+        # Critic loss: minimize TD error squared
+        critic_loss = nn.MSELoss()(values, targets.detach())
+
+        # Update actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # Update critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Clear stored trajectory information
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.next_states = []
+        self.dones = []
 
 # 假设的成本函数（开机成本+时间*发电成本）
 def cost_function(action, time):
@@ -265,7 +274,7 @@ print(np.sum(env.electricity_plan == 0))
 #%%
 state_dim = env.observation_space.shape[0]
 action_dim = env.action_space.n
-agent = SACAgent(state_dim, action_dim, gamma=config.gamma, tau=config.tau, alpha=config.alpha)
+agent = A2CAgent(state_dim, action_dim, gamma=config.gamma)
 
 if mode == 'train':
     num_episodes = config.num_epochs
@@ -273,7 +282,7 @@ if mode == 'train':
     os.makedirs('results', exist_ok=True)
 
     # Open a file to write the rewards
-    with open('results/SAC.txt', 'w') as f:
+    with open('results/A2C.txt', 'w') as f:
         best_reward = -float('inf')
         patience = 100  # Number of episodes to wait for improvement
         patience_counter = 0
@@ -286,9 +295,12 @@ if mode == 'train':
             while not done:
                 action = agent.select_action(state)
                 next_state, reward, done, _ = env.step(action)
-                agent.update(state, action, reward, next_state, done)
+                agent.store_transition(state, action, reward, next_state, done)
                 state = next_state
                 total_reward += reward
+
+            # Update the agent after each episode
+            agent.update()
 
             # Write the reward to the file
             f.write(f"Episode {episode}: Total Reward = {total_reward}\n")
@@ -299,9 +311,8 @@ if mode == 'train':
                 patience_counter = 0
                 # Save the best model parameters
                 os.makedirs('param', exist_ok=True)
-                torch.save(agent.policy_net.state_dict(), f'param/best_policy_net_unit_{unit_id}.pth')
-                torch.save(agent.q_net1.state_dict(), f'param/best_q_net1_unit_{unit_id}.pth')
-                torch.save(agent.q_net2.state_dict(), f'param/best_q_net2_unit_{unit_id}.pth')
+                torch.save(agent.actor.state_dict(), f'param/best_actor_unit_{unit_id}.pth')
+                torch.save(agent.critic.state_dict(), f'param/best_critic_unit_{unit_id}.pth')
             else:
                 patience_counter += 1
 
@@ -313,11 +324,8 @@ if mode == 'train':
                 print(f"Episode {episode}: Total Reward = {total_reward}")
 
 elif mode == 'test':
-    #%% 测试
-    # Load the best model parameters
-    agent.policy_net.load_state_dict(torch.load(f'param/best_policy_net_unit_{unit_id}.pth'))
-    agent.q_net1.load_state_dict(torch.load(f'param/best_q_net1_unit_{unit_id}.pth'))
-    agent.q_net2.load_state_dict(torch.load(f'param/best_q_net2_unit_{unit_id}.pth'))
+    agent.actor.load_state_dict(torch.load(f'param/best_actor_unit_{unit_id}.pth'))
+    agent.critic.load_state_dict(torch.load(f'param/best_critic_unit_{unit_id}.pth'))
 
     # Test the agent
     state = env.reset()
