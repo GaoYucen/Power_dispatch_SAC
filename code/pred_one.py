@@ -18,10 +18,14 @@ if not os.path.exists('param'):
     os.makedirs('param')
 
 #%% read the csv data 'data/11.csv'
-data = pd.read_csv('data/11.csv')
+data = pd.read_csv('data/12.csv')
 
 # Removes the line containing NaN
 data = data.dropna()
+# 仅选取前10000个数据
+data = data.head(10000)
+
+
 
 #%%
 # use different parameters to predict the ROUND
@@ -31,6 +35,16 @@ y = data['ROUND(A.POWER,0)']
 
 # 替换特征名中的特殊字符
 X.columns = [re.sub(r'[^a-zA-Z0-9_]', '_', col) for col in X.columns]
+
+# 数据归一化
+from sklearn.preprocessing import StandardScaler
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_sacled = scaler_X.fit_transform(X)
+y_sacled = scaler_y.fit_transform(y.values.reshape(-1, 1))
+# 将归一化后的数据转回DataFrame
+X = pd.DataFrame(X_sacled, columns=X.columns, index=X.index)
+y = pd.Series(y_sacled.flatten(), index=data.index, name='ROUND(A.POWER,0)')
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
@@ -81,6 +95,14 @@ for name, model in models:
     print(f'Root Mean Squared Error (RMSE): {rmse}')
     print(f'R-squared (R^2): {r2}')
     print('-' * 50)
+
+    # 将这些结果存储到results/pred_one.txt文件中
+    with open('results/pred_one.txt', 'a') as f:
+        f.write(f'{name}:\n')
+        f.write(f'Mean Squared Error (MSE): {mse}\n')
+        f.write(f'Root Mean Squared Error (RMSE): {rmse}\n')
+        f.write(f'R-squared (R^2): {r2}\n')
+        f.write('-' * 50 + '\n')
 
     # 选取前 100 个样本
     y_test_subset = y_test[:100]
